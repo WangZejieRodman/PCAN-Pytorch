@@ -7,7 +7,7 @@ OUTPUT_FILE = "results/results.txt"
 LOG_DIR = 'log/'
 MODEL_FILENAME = "model.ckpt"
 
-DATASET_FOLDER = '/mnt/data2/zwx/'
+DATASET_FOLDER = '/home/wzj/pan1/PointNetVlad-Pytorch/benchmark/'
 
 # TRAIN
 BATCH_NUM_QUERIES = 2
@@ -29,8 +29,8 @@ BN_DECAY_CLIP = 0.99
 
 RESUME = False
 
-TRAIN_FILE = 'generating_queries/training_queries_baseline.pickle'
-TEST_FILE = 'generating_queries/test_queries_baseline.pickle'
+TRAIN_FILE = '/home/wzj/pan1/PointNetVlad-Pytorch/generating_queries/training_queries_baseline.pickle'
+TEST_FILE = '/home/wzj/pan1/PointNetVlad-Pytorch/generating_queries/test_queries_baseline.pickle'
 
 # LOSS
 LOSS_FUNCTION = 'quadruplet'
@@ -43,8 +43,8 @@ EVAL_BATCH_SIZE = 2
 EVAL_POSITIVES_PER_QUERY = 4
 EVAL_NEGATIVES_PER_QUERY = 12
 
-EVAL_DATABASE_FILE = 'generating_queries/business_evaluation_database.pickle'
-EVAL_QUERY_FILE = 'generating_queries/business_evaluation_query.pickle'
+EVAL_DATABASE_FILE = '/home/wzj/pan1/PointNetVlad-Pytorch/generating_queries/oxford_evaluation_database.pickle'
+EVAL_QUERY_FILE = '/home/wzj/pan1/PointNetVlad-Pytorch/generating_queries/oxford_evaluation_query.pickle'
 
 
 def cfg_str():

@@ -7,7 +7,7 @@ from torch.autograd import Variable
 import numpy as np
 import torch.nn.functional as F
 import math
-from pointnet_util import PointNetSetAbstractionMsg, PointNetSetAbstraction,PointNetFeaturePropagation
+from models.pointnet_util import PointNetSetAbstractionMsg, PointNetSetAbstraction, PointNetFeaturePropagation
 
 class NetVLADLoupe(nn.Module):
     def __init__(self, feature_size, max_samples, cluster_size, output_dim,
@@ -38,9 +38,25 @@ class NetVLADLoupe(nn.Module):
 
         self.bn2 = nn.BatchNorm1d(output_dim)
 
-        self.sa1 = PointNetSetAbstractionMsg(256, [0.1, 0.2, 0.4], [16, 32, 64], feature_size,[[16, 16, 32], [32, 32, 64], [32, 64, 64]])
-        self.sa2 = PointNetSetAbstraction(None, None, None, 163, [256, 512], True)
-        self.fp2 = PointNetFeaturePropagation(672, [256, 128])
+        # 修改特征传播层的输入维度
+        self.sa1 = PointNetSetAbstractionMsg(
+            npoint=256,   # 采样后的点云数量，从原始点云中采样256个点
+            radius_list=[0.1, 0.2, 0.4], # 三个不同尺度的球形邻域半径
+            nsample_list=[16, 32, 64], # 每个尺度下采样的邻居点数量
+            in_channel=1024, # 输入特征维度
+            mlp_list=[[16, 16, 32], [32, 32, 64], [32, 64, 64]]# 每个尺度的MLP层配置
+        )
+        self.sa2 = PointNetSetAbstraction(
+            npoint=None,
+            radius=None,
+            nsample=None,
+            in_channel=160,
+            mlp=[256, 512],
+            group_all=True
+        )
+        # 修改特征传播层的输入维度
+        # fp2的输入维度应该是 l1_points.shape[1] + l2_points.shape[1]
+        self.fp2 = PointNetFeaturePropagation(160 + 512, [256, 128])  # 160 from sa1, 512 from sa2
         self.fp1 = PointNetFeaturePropagation(128, [128, 128])
         self.conv1 = nn.Conv1d(128, 128, 1)
         self.bn_conv1 = nn.BatchNorm1d(128)
@@ -52,64 +68,101 @@ class NetVLADLoupe(nn.Module):
                 output_dim, add_batch_norm=add_batch_norm)
 
     def forward(self, x, xyz):
-        x = x.transpose(1, 3).contiguous()
-        x = x.view((-1, self.max_samples, self.feature_size))
+        """
+        x: [B, C, N] 特征张量
+        xyz: [B, 1, N, 3] 原始点云
 
-        l0_points = x.transpose(1, 2).contiguous()
-        l0_xyz = xyz.squeeze(1).transpose(1, 2).contiguous()
+        Returns:
+            vlad: [B, output_dim] VLAD 编码
+            weights: [B, N, 1] 注意力权重
+        """
+        #print(f"NetVLAD input shapes - x: {x.shape}, xyz: {xyz.shape}")
 
-        l1_xyz, l1_points = self.sa1(l0_xyz, l0_points)
-        l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
+        batch_size = x.size(0)
 
-        l1_points = self.fp2(l1_xyz, l2_xyz, l1_points, l2_points)
-        l0_points = self.fp1(l0_xyz, l1_xyz, None, l1_points)
+        # 1. 调整输入维度
+        xyz = xyz.squeeze(1)  # [B, N, 3]
+        x = x.transpose(1, 2).contiguous()  # [B, N, C]
 
-        score = self.drop1(F.relu(self.bn_conv1(self.conv1(l0_points))))
-        score = self.conv2(score)
+        #print(f"After adjustment - xyz: {xyz.shape}, x: {x.shape}")
 
-        score = score.reshape([-1,self.max_samples,1])
+        try:
+            # 2. PointNet++ 特征提取
+            l1_xyz, l1_points = self.sa1(xyz, x)  # [B, N1, 3], [B, C1, N1]
+            #print(f"After SA1 - l1_xyz: {l1_xyz.shape}, l1_points: {l1_points.shape}")
 
-        score = torch.sigmoid(score)
-        weights = score
-        score = score.repeat(1,1, self.cluster_size)
+            l2_xyz, l2_points = self.sa2(l1_xyz, l1_points.transpose(1, 2))  # [B, N2, 3], [B, C2, N2]
+            #print(f"After SA2 - l2_xyz: {l2_xyz.shape}, l2_points: {l2_points.shape}")
 
-        activation = torch.matmul(x, self.cluster_weights)
-        if self.add_batch_norm:
-            # activation = activation.transpose(1,2).contiguous()
-            activation = activation.view(-1, self.cluster_size)
-            activation = self.bn1(activation)
-            activation = activation.view(-1,
-                                         self.max_samples, self.cluster_size)
-            # activation = activation.transpose(1,2).contiguous()
-        else:
-            activation = activation + self.cluster_biases
-        activation = self.softmax(activation)
+            # 3. 特征传播，确保维度匹配
+            l1_points_trans = l1_points.transpose(1, 2)  # [B, N1, C1]
+            l2_points_trans = l2_points.transpose(1, 2)  # [B, N2, C2]
 
-        activation = torch.mul(activation, score)
+            l1_points = self.fp2(l1_xyz, l2_xyz, l1_points_trans, l2_points_trans)  # [B, C3, N1]
+            #print(f"After FP2 - l1_points: {l1_points.shape}")
 
-        #activation = activation.reshape(-1, self.max_samples, self.cluster_size)
+            l0_points = self.fp1(xyz, l1_xyz, None, l1_points.transpose(1, 2))  # [B, C4, N]
+            #print(f"After FP1 - l0_points: {l0_points.shape}")
 
-        a_sum = activation.sum(-2, keepdim=True)
-        a = a_sum * self.cluster_weights2
+            # 4. 注意力权重计算
+            score = self.drop1(F.relu(self.bn_conv1(self.conv1(l0_points))))  # [B, 128, N]
+            score = self.conv2(score)  # [B, 1, N]
+            score = score.transpose(1, 2)  # [B, N, 1]
+            #print(f"Attention score shape: {score.shape}")
 
-        activation = torch.transpose(activation, 2, 1)
-        x = x.view((-1, self.max_samples, self.feature_size))
-        vlad = torch.matmul(activation, x)
-        vlad = torch.transpose(vlad, 2, 1)
-        vlad = vlad - a
+            # 5. NetVLAD 处理
+            score = torch.sigmoid(score)  # [B, N, 1]
+            weights = score  # 保存用于返回
+            score = score.repeat(1, 1, self.cluster_size)  # [B, N, K]
 
-        vlad = F.normalize(vlad, dim=1, p=2)
-        vlad = vlad.reshape((-1, self.cluster_size * self.feature_size))
-        vlad = F.normalize(vlad, dim=1, p=2)
+            # 6. VLAD 特征聚合
+            x_t = x  # [B, N, C]
+            activation = torch.matmul(x_t, self.cluster_weights) # activation 表示每个点属于每个聚类中心的概率（或称为隶属度）。 # [B, N, K]
 
-        vlad = torch.matmul(vlad, self.hidden1_weights)
+            if self.add_batch_norm:
+                activation = activation.view(-1, self.cluster_size)
+                activation = self.bn1(activation)
+                activation = activation.view(batch_size, -1, self.cluster_size)
+            else:
+                activation = activation + self.cluster_biases
 
-        vlad = self.bn2(vlad)
+            activation = self.softmax(activation)  # [B, N, K]
+            activation = torch.mul(activation, score)  # [B, N, K]
 
-        if self.gating:
-            vlad = self.context_gating(vlad)
+            # 7. VLAD 池化
+            a_sum = activation.sum(-2, keepdim=True)  # [B, 1, K]
+            a = a_sum * self.cluster_weights2  # a[b,f,k]表示：对于批次中的第b个样本，在特征维度f上，聚类中心k的全局期望激活强度。 # [B, C, K]
 
-        return vlad, weights
+            activation = activation.transpose(2, 1)  # [B, K, N]
+            vlad = torch.matmul(activation, x_t)# vlad[b, k, f] 表示批次中第 b 个样本中，所有点在特征维度 f 上属于第 k 个聚类中心的加权和。  # [B, K, C]
+            vlad = vlad.transpose(2, 1)  # [B, C, K]
+            vlad = vlad - a # 计算局部特征与全局期望的偏差，消除聚类中心权重本身的偏置影响
+
+            # 8. 特征规范化 - 添加 contiguous()
+            vlad = F.normalize(vlad, p=2, dim=1)  # 第一阶段归一化 （按特征通道）：确保每个聚类中心的特征向量具有单位范数，消除不同聚类中心之间的相对尺度差异。
+            vlad = vlad.contiguous()  # 添加这一行
+            vlad = vlad.view(batch_size, -1)  # [B, C*K]
+            vlad = F.normalize(vlad, p=2, dim=1)  # 第二阶段归一化 （展开后整体）：控制整个描述符的全局范数，符合大多数检索系统对特征向量的标准化要求。
+
+            # 9. 最终投影
+            vlad = torch.matmul(vlad, self.hidden1_weights)  # [B, output_dim]
+            vlad = self.bn2(vlad)
+
+            # 10. 上下文门控（可选）
+            if self.gating:
+                vlad = self.context_gating(vlad)
+
+            #print(f"Final output shapes - vlad: {vlad.shape}, weights: {weights.shape}")
+            return vlad, weights
+
+        except RuntimeError as e:
+            print("\nError occurred in NetVLAD forward pass:")
+            print(f"Current tensor shapes:")
+            print(f"xyz: {xyz.shape}")
+            print(f"x: {x.shape}")
+            print(f"l1_xyz: {l1_xyz.shape if 'l1_xyz' in locals() else 'Not created'}")
+            print(f"l1_points: {l1_points.shape if 'l1_points' in locals() else 'Not created'}")
+            raise e
 
 
 class GatingContext(nn.Module):
@@ -163,7 +216,7 @@ class STN3d(nn.Module):
         self.conv1 = torch.nn.Conv2d(self.channels, 64, (1, self.kernel_size))
         self.conv2 = torch.nn.Conv2d(64, 128, (1,1))
         self.conv3 = torch.nn.Conv2d(128, 1024, (1,1))
-        self.mp1 = torch.nn.MaxPool2d((num_points, 1), 1)
+        self.mp1 = torch.nn.MaxPool2d((num_points, 1), 1)# 在(4096,1)的池化窗口内取最大值，也就是以一个点云文件为单位，找到这个点云文件的各个特征通道上的最大值。
         self.fc1 = nn.Linear(1024, 512)
         self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, k*k)
@@ -223,7 +276,7 @@ class PointNetfeat(nn.Module):
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(64)
         self.bn4 = nn.BatchNorm2d(128)
-        self.bn5 = nn.BatchNorm2d(1024)
+        self.bn5 = nn.BatchNorm2d(1024) # 对1024个通道进行标准化，对每个batch的数据进行标准化，使其均值为0，方差为1
         self.mp1 = torch.nn.MaxPool2d((num_points, 1), 1)
         self.num_points = num_points
         self.global_feat = global_feat
@@ -267,28 +320,55 @@ class PointNetVlad(nn.Module):
     def __init__(self, num_points=2500, global_feat=True, feature_transform=False, max_pool=True, output_dim=1024):
         super(PointNetVlad, self).__init__()
         self.point_net = PointNetfeat(num_points=num_points, global_feat=global_feat,
-                                      feature_transform=feature_transform, max_pool=max_pool)
+                                    feature_transform=feature_transform, max_pool=max_pool)
         self.net_vlad = NetVLADLoupe(feature_size=1024, max_samples=num_points, cluster_size=64,
-                                     output_dim=output_dim, gating=True, add_batch_norm=True,
-                                     is_training=True)
+                                    output_dim=output_dim, gating=True, add_batch_norm=True,
+                                    is_training=True)
+        # 添加 max_pool 属性
+        self.max_pool = max_pool
 
     def forward(self, x):
-        f = self.point_net(x)
-        x, weights = self.net_vlad(f,x)
-        return x, weights
+        #print(f"Input shape: {x.shape}")  # [B, 1, N, 3]
+
+        f = self.point_net(x)  # 获取特征
+        #print(f"PointNet output shape: {f.shape if not isinstance(f, tuple) else [t.shape for t in f]}")
+
+        if isinstance(f, tuple):
+            f = f[0]
+
+        if not self.max_pool and len(f.shape) == 4:
+            f = f.squeeze(-1)  # 移除最后的维度，得到 [B, C, N]
+        #print(f"Feature shape before NetVLAD: {f.shape}")
+
+        vlad, weights = self.net_vlad(f, x)
+        return vlad, weights
 
 from torchsummary import summary
 
-
 if __name__ == '__main__':
     num_points = 4096
-    # sim_data = Variable(torch.rand(44, 1, num_points, 3))
-    # sim_data = sim_data.cuda()
-    #
-    pnv = PointNetVlad.PointNetVlad(global_feat=True, feature_transform=True, max_pool=False,
-                                     output_dim=256, num_points=num_points).cuda()
-    # pnv.train()
-    # out3 = pnv(sim_data)
-    # print('pnv', out3.size())
 
-    summary(pnv, input_size=(1, num_points, 3), batchsize=1)
+    # 创建示例输入数据
+    sample_input = torch.randn(1, 1, num_points, 3).cuda()  # [batch_size, channels, num_points, xyz]
+
+    # 初始化模型
+    pnv = PointNetVlad(global_feat=True, feature_transform=True, max_pool=False,
+                       output_dim=256, num_points=num_points).cuda()
+    # 将模型设置为评估模式
+    pnv.eval()  # 添加这一行
+
+    # 打印模型结构
+    print("Model structure:")
+    print(pnv)
+
+    # 打印参数数量
+    total_params = sum(p.numel() for p in pnv.parameters())
+    print(f'\nTotal parameters: {total_params:,}')
+
+    # 测试前向传播
+    print("\nTesting forward pass:")
+    print(f'Input shape: {sample_input.shape}')
+    with torch.no_grad():
+        output, weights = pnv(sample_input)
+        print(f'Output shape: {output.shape}')
+        print(f'Weights shape: {weights.shape}')

@@ -55,28 +55,28 @@ def triplet_ranking_loss(q_vec, pos_vecs, neg_vecs, margin, use_min=False, lazy=
     B = q_vec.shape[0]
     L = q_vec.shape[2]
 
-    print('q_vec.size(), pos_vecs.size()', q_vec.size(), pos_vecs.size())
+    #print('q_vec.size(), pos_vecs.size()', q_vec.size(), pos_vecs.size())
 
     dist_pos = ((q_vec - pos_vecs) ** 2).sum(2)
     dist_pos = dist_pos.view(B, 1)
-    print('dist_pos.size()', dist_pos.size())
+    #print('dist_pos.size()', dist_pos.size())
 
     output_anchors = q_vec.expand_as(neg_vecs).contiguous().view(-1, L)
-    print(output_anchors.shape)
+    #print(output_anchors.shape)
     output_negatives = neg_vecs.contiguous().view(-1, L)
-    print(output_negatives.shape)
+    #print(output_negatives.shape)
     dist_neg = ((output_anchors - output_negatives) ** 2).sum(1)
-    print(dist_neg.shape)
+    #print(dist_neg.shape)
     dist_neg = dist_neg.view(B, -1)
 
-    print('dist_neg.size()', dist_neg.size())
+    #print('dist_neg.size()', dist_neg.size())
 
     dist = - torch.cat((dist_pos, dist_neg), 1)
-    print(dist.shape)
+    #print(dist.shape)
     dist = F.log_softmax(dist, 1)
-    print(dist.shape)
+    #print(dist.shape)
     loss = (- dist[:, 0]).mean()
-    print('loss', loss.shape, loss)
+    #print('loss', loss.shape, loss)
 
     return loss
 

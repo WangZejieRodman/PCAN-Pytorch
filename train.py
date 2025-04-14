@@ -12,6 +12,7 @@ import config as cfg
 import evaluate
 import loss.pointnetvlad_loss as PNV_loss
 import models.PointNetVlad as PNV
+import models.PCAN as PCAN
 import torch
 import torch.nn as nn
 from loading_pointclouds import *
@@ -19,7 +20,8 @@ from tensorboardX import SummaryWriter
 from torch.autograd import Variable
 from torch.backends import cudnn
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 
@@ -28,16 +30,16 @@ sys.path.append(BASE_DIR)
 cudnn.enabled = True
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--log_dir', default='log_temp/', help='Log dir [default: log]')
+parser.add_argument('--log_dir', default='log/', help='Log dir [default: log]')
 parser.add_argument('--results_dir', default='results/',
                     help='results dir [default: results]')
 parser.add_argument('--positives_per_query', type=int, default=1,
                     help='Number of potential positives in each training tuple [default: 2]')
 parser.add_argument('--negatives_per_query', type=int, default=9,
                     help='Number of definite negatives in each training tuple [default: 18]')
-parser.add_argument('--max_epoch', type=int, default=20,
+parser.add_argument('--max_epoch', type=int, default=10,
                     help='Epoch to run [default: 20]')
-parser.add_argument('--batch_num_queries', type=int, default=1,
+parser.add_argument('--batch_num_queries', type=int, default=4,
                     help='Batch Size during training [default: 2]')
 parser.add_argument('--learning_rate', type=float, default=0.000005,
                     help='Initial learning rate [default: 0.000005]')
@@ -61,9 +63,9 @@ parser.add_argument('--loss_ignore_zero_batch', action='store_true',
                     help='If present, mean only batches with loss > 0.0')
 parser.add_argument('--triplet_use_best_positives', action='store_true',
                     help='If present, use best positives, otherwise use hardest positives')
-parser.add_argument('--resume', action='store_true', default=False,
+parser.add_argument('--resume', action='store_false', default=True,
                     help='If present, restore checkpoint and resume training')
-parser.add_argument('--dataset_folder', default='/mnt/data/benchmark_datasets/',
+parser.add_argument('--dataset_folder', default='/home/wzj/pan1/PointNetVlad-Pytorch/benchmark/',
                     help='PointNetVlad Dataset Folder')
 
 FLAGS = parser.parse_args()
@@ -87,8 +89,8 @@ cfg.TRIPLET_USE_BEST_POSITIVES = FLAGS.triplet_use_best_positives
 cfg.LOSS_LAZY = FLAGS.loss_not_lazy
 cfg.LOSS_IGNORE_ZERO_BATCH = FLAGS.loss_ignore_zero_batch
 
-cfg.TRAIN_FILE = 'generating_queries/training_queries_baseline.pickle'
-cfg.TEST_FILE = 'generating_queries/test_queries_baseline.pickle'
+cfg.TRAIN_FILE = '/home/wzj/pan1/PointNetVlad-Pytorch/generating_queries/training_queries_baseline.pickle'
+cfg.TEST_FILE = '/home/wzj/pan1/PointNetVlad-Pytorch/generating_queries//test_queries_baseline.pickle'
 
 cfg.LOG_DIR = FLAGS.log_dir
 if not os.path.exists(cfg.LOG_DIR):
@@ -157,7 +159,7 @@ def train():
     train_writer = SummaryWriter(os.path.join(cfg.LOG_DIR, 'train'))
     #test_writer = SummaryWriter(os.path.join(cfg.LOG_DIR, 'test'))
 
-    model = PNV.PointNetVlad(global_feat=True, feature_transform=True,
+    model = PCAN.PointNetVlad(global_feat=True, feature_transform=True,
                              max_pool=False, output_dim=cfg.FEATURE_OUTPUT_DIM, num_points=cfg.NUM_POINTS)
     model = model.to(device)
 
@@ -176,7 +178,7 @@ def train():
         #resume_filename = cfg.LOG_DIR + "checkpoint.pth.tar"
         resume_filename = cfg.LOG_DIR + "model.ckpt"
         print("Resuming From ", resume_filename)
-        checkpoint = torch.load(resume_filename)
+        checkpoint = torch.load(resume_filename, weights_only=False)
         saved_state_dict = checkpoint['state_dict']
         starting_epoch = checkpoint['epoch']
         TOTAL_ITERATIONS = starting_epoch * len(TRAINING_QUERIES)
@@ -223,6 +225,7 @@ def train_one_epoch(model, optimizer, train_writer, loss_function, epoch):
     np.random.shuffle(train_file_idxs)
 
     for i in range(len(train_file_idxs)//cfg.BATCH_NUM_QUERIES):
+
         # for i in range (5):
         batch_keys = train_file_idxs[i *
                                      cfg.BATCH_NUM_QUERIES:(i+1)*cfg.BATCH_NUM_QUERIES]
@@ -320,11 +323,14 @@ def train_one_epoch(model, optimizer, train_writer, loss_function, epoch):
         loss.backward()
         optimizer.step()
 
+        # 每次迭代后清理缓存
+        torch.cuda.empty_cache()
+
         log_string('batch loss: %f' % loss)
         train_writer.add_scalar("Loss", loss.cpu().item(), TOTAL_ITERATIONS)
         TOTAL_ITERATIONS += cfg.BATCH_NUM_QUERIES
 
-        # EVALLLL
+        # EVAL
 
         if (epoch > 5 and i % (1400 // cfg.BATCH_NUM_QUERIES) == 29):
             TRAINING_LATENT_VECTORS = get_latent_vectors(
@@ -347,6 +353,7 @@ def train_one_epoch(model, optimizer, train_writer, loss_function, epoch):
             print("Model Saved As " + save_name)
 
 
+
 def get_feature_representation(filename, model):
     model.eval()
     queries = load_pc_files([filename])
@@ -360,6 +367,8 @@ def get_feature_representation(filename, model):
         q = torch.from_numpy(queries).float()
         q = q.to(device)
         output = model(q)
+        if isinstance(output, tuple):
+            output = output[0]
     output = output.detach().cpu().numpy()
     output = np.squeeze(output)
     model.train()
@@ -403,6 +412,8 @@ def get_latent_vectors(model, dict_to_process):
         feed_tensor = feed_tensor.to(device)
         with torch.no_grad():
             out = model(feed_tensor)
+            if isinstance(out, tuple):
+                out = out[0]  # Get just the VLAD features, ignore weights
 
         out = out.detach().cpu().numpy()
         out = np.squeeze(out)
@@ -432,6 +443,8 @@ def get_latent_vectors(model, dict_to_process):
         with torch.no_grad():
             queries_tensor = torch.from_numpy(queries).float()
             o1 = model(queries_tensor)
+            if isinstance(o1, tuple):
+                o1 = o1[0]  # Get just the VLAD features
 
         output = o1.detach().cpu().numpy()
         output = np.squeeze(output)
@@ -450,20 +463,24 @@ def run_model(model, queries, positives, negatives, other_neg, require_grad=True
     positives_tensor = torch.from_numpy(positives).float()
     negatives_tensor = torch.from_numpy(negatives).float()
     other_neg_tensor = torch.from_numpy(other_neg).float()
-    #print('other_neg_tensor', queries_tensor.size(), other_neg_tensor.size(), positives_tensor.size(), negatives_tensor.size())
-    feed_tensor = torch.cat(
-        (queries_tensor, positives_tensor, negatives_tensor, other_neg_tensor), 1)
-    feed_tensor = feed_tensor.view((-1, 1, cfg.NUM_POINTS, 3))
-    feed_tensor.requires_grad_(require_grad)
-    feed_tensor = feed_tensor.to(device)
-    if require_grad:
-        output = model(feed_tensor)
-    else:
-        with torch.no_grad():
-            output = model(feed_tensor)
-    output = output.view(cfg.BATCH_NUM_QUERIES, -1, cfg.FEATURE_OUTPUT_DIM)
-    o1, o2, o3, o4 = torch.split(
-        output, [1, cfg.TRAIN_POSITIVES_PER_QUERY, negatives.shape[1], 1], dim=1)
+
+    # 使用with语句来确保正确释放内存
+    with torch.set_grad_enabled(require_grad):
+        feed_tensor = torch.cat(
+            (queries_tensor, positives_tensor, negatives_tensor, other_neg_tensor), 1)
+        feed_tensor = feed_tensor.view((-1, 1, cfg.NUM_POINTS, 3))
+        feed_tensor = feed_tensor.to(device)
+
+        vlad, weights = model(feed_tensor)
+
+        vlad = vlad.view(cfg.BATCH_NUM_QUERIES, -1, cfg.FEATURE_OUTPUT_DIM)
+        o1, o2, o3, o4 = torch.split(
+            vlad, [1, cfg.TRAIN_POSITIVES_PER_QUERY, negatives.shape[1], 1], dim=1)
+
+        # # 如果不需要权重，可以删除这部分
+        # weights = weights.view(cfg.BATCH_NUM_QUERIES, -1, cfg.NUM_POINTS, 1)
+        # w1, w2, w3, w4 = torch.split(
+        #     weights, [1, cfg.TRAIN_POSITIVES_PER_QUERY, negatives.shape[1], 1], dim=1)
 
     return o1, o2, o3, o4
 
